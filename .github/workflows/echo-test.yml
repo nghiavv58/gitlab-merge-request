@@ -1,0 +1,13 @@
+name: Echo 123 on Push
+
+# Kích hoạt workflow mỗi khi có sự kiện push code lên bất kỳ nhánh nào
+on: [push]
+
+jobs:
+  print-number:
+    # Sử dụng máy chủ ảo Ubuntu mới nhất của GitHub
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: In ra số 123
+        run: echo "123"
