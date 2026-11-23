@@ -1,7 +1,12 @@
 # Đặt file này vào repo GitHub nghiavv58/gitlab-merge-request: .github/workflows/gitlab-mr.yml
 # Secret cần có (Settings → Secrets and variables → Actions): GITLAB_TOKEN (GitLab PAT, scope "api").
-# Gọi bởi .share/scripts/mr-create.sh (repository_dispatch, event_type gitlab_mr). In "MR_URL=<url>" cho script đọc.
+# Gọi bởi .share/scripts/mr-create.sh (action create) và mr-merge.sh (action merge), repository_dispatch event_type
+# gitlab_mr. In "MR_URL=<url>" (và "MERGE=<merged|auto_merge>") cho script đọc; tên run chứa request_id của lần gọi.
+#   create: tạo MR source → target (đã có MR mở thì trả MR đó). MR vào main luôn là Draft.
+#   merge : merge MR đang mở source → target, CHỈ khi target thuộc MERGE_TARGETS (dev, develop), MR không Draft,
+#           không conflict, và đúng commit sha script gửi (nếu có). Pipeline đang chạy → bật auto-merge.
 name: GitLab merge request
+run-name: "${{ github.event.client_payload.action || 'create' }} ${{ github.event.client_payload.target_branch }} ${{ github.event.client_payload.request_id }}"
 
 on:
   repository_dispatch:
@@ -11,26 +16,27 @@ permissions:
   contents: read
 
 jobs:
-  create-mr:
+  gitlab-mr:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Create (or find) the merge request
+      - name: Create or merge the merge request
         env:
           # payload đi qua env, không chèn ${{ }} vào script (tránh chèn lệnh)
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+          MERGE_TARGETS: dev,develop
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, sys, urllib.parse, urllib.request, urllib.error
+          import json, os, sys, time, urllib.parse, urllib.request, urllib.error
 
           p = json.loads(os.environ["PAYLOAD"])
-          for k in ("project", "source_branch", "target_branch", "title"):
+          action = (p.get("action") or "create").strip()
+          for k in ("project", "source_branch", "target_branch"):
               if not str(p.get(k) or "").strip():
                   sys.exit(f"missing {k}")
-          if p["target_branch"] == "main" and not p["title"].startswith("Draft:"):
-              p["title"] = "Draft: " + p["title"]          # rule: an MR into main is always Draft
+          src, dst = p["source_branch"], p["target_branch"]
           api = "https://gitlab.com/api/v4/projects/" + urllib.parse.quote(p["project"], safe="")
           head = {"PRIVATE-TOKEN": os.environ["GITLAB_TOKEN"], "Content-Type": "application/json"}
 
@@ -41,21 +47,71 @@ jobs:
                   with urllib.request.urlopen(req, timeout=30) as r:
                       return r.status, json.load(r)
               except urllib.error.HTTPError as e:
-                  return e.code, json.loads(e.read() or b"{}")
+                  try:
+                      return e.code, json.loads(e.read() or b"{}")
+                  except ValueError:
+                      return e.code, {}
 
-          body = {"source_branch": p["source_branch"], "target_branch": p["target_branch"], "title": p["title"],
-                  "remove_source_branch": bool(p.get("remove_source_branch"))}
-          if str(p.get("assignee_id") or "").isdigit():
-              body["assignee_id"] = int(p["assignee_id"])
-          code, mr = call("POST", api + "/merge_requests", body)
-          if code == 409:   # an open MR for this source → target already exists
-              q = urllib.parse.urlencode({"state": "opened", "source_branch": p["source_branch"],
-                                          "target_branch": p["target_branch"]})
+          def open_mr():
+              q = urllib.parse.urlencode({"state": "opened", "source_branch": src, "target_branch": dst})
               code, found = call("GET", api + "/merge_requests?" + q)
-              mr = found[0] if code == 200 and found else {}
-              print("MR đã có sẵn")
-          if not mr.get("web_url"):
-              sys.exit(f"GitLab HTTP {code}: {mr.get('message') or mr}")
-          print(f"{p['source_branch']} → {p['target_branch']}: !{mr['iid']} {mr['title']}")
-          print("MR_URL=" + mr["web_url"])
+              return found[0] if code == 200 and found else {}
+
+          def done(mr, extra=""):
+              print(f"{src} → {dst}: !{mr['iid']} {mr['title']}{extra}")
+              print("MR_URL=" + mr["web_url"])
+
+          if action == "create":
+              title = str(p.get("title") or src)
+              if dst == "main" and not title.startswith("Draft:"):
+                  title = "Draft: " + title          # rule: an MR into main is always Draft
+              body = {"source_branch": src, "target_branch": dst, "title": title,
+                      "remove_source_branch": bool(p.get("remove_source_branch"))}
+              if str(p.get("assignee_id") or "").isdigit():
+                  body["assignee_id"] = int(p["assignee_id"])
+              code, mr = call("POST", api + "/merge_requests", body)
+              if code == 409:   # an open MR for this source → target already exists
+                  mr = open_mr()
+                  print("MR đã có sẵn")
+              if not mr.get("web_url"):
+                  sys.exit(f"GitLab HTTP {code}: {mr.get('message') or mr}")
+              done(mr)
+
+          elif action == "merge":
+              allowed = [t.strip() for t in os.environ["MERGE_TARGETS"].split(",") if t.strip()]
+              if dst not in allowed:
+                  sys.exit(f"merge refused: target {dst} is not one of {allowed} (staging / main are merged by hand)")
+              mr = open_mr()
+              if not mr:
+                  sys.exit(f"no open merge request {src} → {dst}")
+              code, mr = call("GET", api + f"/merge_requests/{mr['iid']}")
+              if mr.get("draft") or mr.get("work_in_progress"):
+                  sys.exit(f"merge refused: !{mr['iid']} is Draft")
+              if mr.get("has_conflicts"):
+                  sys.exit(f"merge refused: !{mr['iid']} has conflicts with {dst}")
+              sha = str(p.get("sha") or "").strip()
+              if sha and not str(mr.get("sha") or "").startswith(sha):
+                  sys.exit(f"merge refused: !{mr['iid']} is at {mr.get('sha', '')[:8]}, not the pushed {sha[:8]}")
+              # GitLab computes mergeability in the background right after a push: wait for it
+              for _ in range(12):
+                  status = mr.get("detailed_merge_status") or ""
+                  if status not in ("checking", "unchecked", "preparing", "approvals_syncing"):
+                      break
+                  time.sleep(5)
+                  code, mr = call("GET", api + f"/merge_requests/{mr['iid']}")
+              print(f"detailed_merge_status={status}")
+              body = {"sha": mr["sha"], "should_remove_source_branch": False}
+              if status in ("ci_still_running", "ci_must_pass"):
+                  body["auto_merge"] = True                  # merge when the pipeline succeeds
+              elif status != "mergeable":
+                  sys.exit(f"merge refused: !{mr['iid']} detailed_merge_status={status}")
+              code, out = call("PUT", api + f"/merge_requests/{mr['iid']}/merge", body)
+              if code != 200:
+                  sys.exit(f"GitLab merge HTTP {code}: {out.get('message') or out}")
+              state = "merged" if out.get("state") == "merged" else "auto_merge"
+              done(out, f" ({state})")
+              print("MERGE=" + state)
+
+          else:
+              sys.exit(f"unknown action {action}")
           PY
