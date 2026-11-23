@@ -1,7 +1,19 @@
 name: Echo 123 on Push
 
-# Kích hoạt workflow mỗi khi có sự kiện push code lên bất kỳ nhánh nào
-on: [push]
+
+
+
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  repository_dispatch:
+    types: [job_trigger]
+
+
+    
+
 
 jobs:
   print-number:
