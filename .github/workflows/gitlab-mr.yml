@@ -1,0 +1,61 @@
+# Đặt file này vào repo GitHub nghiavv58/gitlab-merge-request: .github/workflows/gitlab-mr.yml
+# Secret cần có (Settings → Secrets and variables → Actions): GITLAB_TOKEN (GitLab PAT, scope "api").
+# Gọi bởi .share/scripts/mr-create.sh (repository_dispatch, event_type gitlab_mr). In "MR_URL=<url>" cho script đọc.
+name: GitLab merge request
+
+on:
+  repository_dispatch:
+    types: [gitlab_mr]
+
+permissions:
+  contents: read
+
+jobs:
+  create-mr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create (or find) the merge request
+        env:
+          # payload đi qua env, không chèn ${{ }} vào script (tránh chèn lệnh)
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, urllib.parse, urllib.request, urllib.error
+
+          p = json.loads(os.environ["PAYLOAD"])
+          for k in ("project", "source_branch", "target_branch", "title"):
+              if not str(p.get(k) or "").strip():
+                  sys.exit(f"missing {k}")
+          if p["target_branch"] == "main" and not p["title"].startswith("Draft:"):
+              p["title"] = "Draft: " + p["title"]          # rule: an MR into main is always Draft
+          api = "https://gitlab.com/api/v4/projects/" + urllib.parse.quote(p["project"], safe="")
+          head = {"PRIVATE-TOKEN": os.environ["GITLAB_TOKEN"], "Content-Type": "application/json"}
+
+          def call(method, url, body=None):
+              req = urllib.request.Request(url, method=method, headers=head,
+                                           data=json.dumps(body).encode() if body is not None else None)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return r.status, json.load(r)
+              except urllib.error.HTTPError as e:
+                  return e.code, json.loads(e.read() or b"{}")
+
+          body = {"source_branch": p["source_branch"], "target_branch": p["target_branch"], "title": p["title"],
+                  "remove_source_branch": bool(p.get("remove_source_branch"))}
+          if str(p.get("assignee_id") or "").isdigit():
+              body["assignee_id"] = int(p["assignee_id"])
+          code, mr = call("POST", api + "/merge_requests", body)
+          if code == 409:   # an open MR for this source → target already exists
+              q = urllib.parse.urlencode({"state": "opened", "source_branch": p["source_branch"],
+                                          "target_branch": p["target_branch"]})
+              code, found = call("GET", api + "/merge_requests?" + q)
+              mr = found[0] if code == 200 and found else {}
+              print("MR đã có sẵn")
+          if not mr.get("web_url"):
+              sys.exit(f"GitLab HTTP {code}: {mr.get('message') or mr}")
+          print(f"{p['source_branch']} → {p['target_branch']}: !{mr['iid']} {mr['title']}")
+          print("MR_URL=" + mr["web_url"])
+          PY
