@@ -5,11 +5,13 @@
 #   create: tạo MR source → target (đã có MR mở thì trả MR đó). MR vào main luôn là Draft.
 #   merge : merge MR đang mở source → target, CHỈ khi target thuộc MERGE_TARGETS (dev, develop), MR không Draft,
 #           không conflict, và đúng commit sha script gửi (nếu có). Pipeline đang chạy → bật auto-merge.
+#   info  : CHỈ ĐỌC. query (vd MRAG-1939, tên nhánh; trống = mọi MR đang mở): các nhánh khớp (commit cuối, ngày),
+#           nhánh đã merge vào đâu (MR merged), MR đang mở (Draft, merge status, conflict, link). In "INFO_JSON=…".
 # Mỗi run ghi vào Job summary (trang run → Summary) và log: thông tin MR (nguồn → đích, trạng thái, commit), danh sách
 # file thay đổi (+/− dòng) và, với merge, từng bước kiểm tra trước khi merge (✅ / ❌ + lý do). Script trên VPS in lại
 # các dòng "MR_INFO ..." của log.
 name: GitLab merge request
-run-name: "${{ github.event.client_payload.action || 'create' }} ${{ github.event.client_payload.target_branch }} ${{ github.event.client_payload.request_id }}"
+run-name: "${{ github.event.client_payload.action || 'create' }} ${{ github.event.client_payload.target_branch || github.event.client_payload.query }} ${{ github.event.client_payload.request_id }}"
 
 on:
   repository_dispatch:
@@ -36,10 +38,10 @@ jobs:
 
           p = json.loads(os.environ["PAYLOAD"])
           action = (p.get("action") or "create").strip()
-          for k in ("project", "source_branch", "target_branch"):
+          for k in ("project",) if action == "info" else ("project", "source_branch", "target_branch"):
               if not str(p.get(k) or "").strip():
                   sys.exit(f"missing {k}")
-          src, dst = p["source_branch"], p["target_branch"]
+          src, dst = p.get("source_branch") or "", p.get("target_branch") or ""
           api = "https://gitlab.com/api/v4/projects/" + urllib.parse.quote(p["project"], safe="")
           head = {"PRIVATE-TOKEN": os.environ["GITLAB_TOKEN"], "Content-Type": "application/json"}
           summary = []          # markdown of the Job summary, written at the end (also when the run stops early)
@@ -200,6 +202,52 @@ jobs:
               summary.append(f"\n**{'✅ Đã merge' if state == 'merged' else '⏳ Auto-merge: chờ pipeline'}**")
               done(out, f" ({state})")
               print("MERGE=" + state)
+              write_summary()
+
+          elif action == "info":
+              # read only: GET requests, nothing is created, merged or changed
+              query = str(p.get("query") or "").strip()
+              q = query.lower()
+
+              def mr_row(m):
+                  return {"iid": m["iid"], "source": m["source_branch"], "target": m["target_branch"],
+                          "title": m.get("title", ""), "state": m.get("state"), "draft": bool(m.get("draft")),
+                          "merge_status": m.get("detailed_merge_status"), "conflicts": bool(m.get("has_conflicts")),
+                          "author": (m.get("author") or {}).get("username"), "updated": (m.get("updated_at") or "")[:16],
+                          "merged_at": (m.get("merged_at") or "")[:16], "url": m.get("web_url")}
+
+              _, opened = call("GET", api + "/merge_requests?state=opened&per_page=100&order_by=updated_at")
+              opened = [mr_row(m) for m in (opened if isinstance(opened, list) else [])
+                        if not q or q in m["source_branch"].lower() or q in (m.get("title") or "").lower()]
+              branches = []
+              if query:
+                  _, found = call("GET", api + "/repository/branches?per_page=100&search=" + urllib.parse.quote(query))
+                  for b in (found if isinstance(found, list) else [])[:30]:
+                      c = b.get("commit") or {}
+                      _, merged = call("GET", api + "/merge_requests?state=merged&per_page=50&source_branch="
+                                       + urllib.parse.quote(b["name"]))
+                      branches.append({"name": b["name"], "commit": c.get("short_id"), "date": (c.get("committed_date") or "")[:16],
+                                       "title": c.get("title", ""), "merged_into_default": bool(b.get("merged")),
+                                       "merged_mrs": [mr_row(m) for m in (merged if isinstance(merged, list) else [])],
+                                       "open_mrs": [m for m in opened if m["source"] == b["name"]]})
+              info(f"project {p['project']} | query '{query or '*'}' | {len(branches)} nhánh, {len(opened)} MR đang mở")
+              summary.extend([f"## {p['project']}: {query or 'mọi MR đang mở'}", ""])
+              if branches:
+                  summary.extend(["### Nhánh", "", "| Nhánh | Commit cuối | Đã merge (MR) | MR đang mở |", "|---|---|---|---|"])
+                  for b in branches:
+                      done_to = ", ".join(f"{m['target']} !{m['iid']} ({m['merged_at']})" for m in b["merged_mrs"]) or "—"
+                      open_to = ", ".join(f"{m['target']} !{m['iid']}{' Draft' if m['draft'] else ''}" for m in b["open_mrs"]) or "—"
+                      info(f"  nhánh {b['name']} @{b['commit']} {b['date']} | đã merge: {done_to} | đang mở: {open_to}")
+                      summary.append(f"| `{b['name']}` | `{b['commit']}` {b['date']} {b['title'][:60]} | {done_to} | {open_to} |")
+                  summary.append("")
+              summary.extend(["### MR đang mở", "", "| MR | Nhánh | Draft | Merge status | Conflict | Cập nhật |",
+                              "|---|---|---|---|---|---|"])
+              for m in opened:
+                  info(f"  MR !{m['iid']} {m['source']} → {m['target']} | draft={m['draft']} status={m['merge_status']} "
+                       f"conflicts={m['conflicts']} | {m['updated']} | {m['url']}")
+                  summary.append(f"| [!{m['iid']}]({m['url']}) | `{m['source']}` → `{m['target']}` | "
+                                 f"{'có' if m['draft'] else ''} | `{m['merge_status']}` | {'có' if m['conflicts'] else ''} | {m['updated']} |")
+              print("INFO_JSON=" + json.dumps({"query": query, "branches": branches, "open_mrs": opened}, ensure_ascii=False))
               write_summary()
 
           else:
