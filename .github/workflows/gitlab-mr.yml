@@ -5,6 +5,9 @@
 #   create: tạo MR source → target (đã có MR mở thì trả MR đó). MR vào main luôn là Draft.
 #   merge : merge MR đang mở source → target, CHỈ khi target thuộc MERGE_TARGETS (dev, develop), MR không Draft,
 #           không conflict, và đúng commit sha script gửi (nếu có). Pipeline đang chạy → bật auto-merge.
+# Mỗi run ghi vào Job summary (trang run → Summary) và log: thông tin MR (nguồn → đích, trạng thái, commit), danh sách
+# file thay đổi (+/− dòng) và, với merge, từng bước kiểm tra trước khi merge (✅ / ❌ + lý do). Script trên VPS in lại
+# các dòng "MR_INFO ..." của log.
 name: GitLab merge request
 run-name: "${{ github.event.client_payload.action || 'create' }} ${{ github.event.client_payload.target_branch }} ${{ github.event.client_payload.request_id }}"
 
@@ -39,6 +42,8 @@ jobs:
           src, dst = p["source_branch"], p["target_branch"]
           api = "https://gitlab.com/api/v4/projects/" + urllib.parse.quote(p["project"], safe="")
           head = {"PRIVATE-TOKEN": os.environ["GITLAB_TOKEN"], "Content-Type": "application/json"}
+          summary = []          # markdown of the Job summary, written at the end (also when the run stops early)
+          checks = []           # merge: (ok, check, detail), in the order they are made
 
           def call(method, url, body=None):
               req = urllib.request.Request(url, method=method, headers=head,
@@ -52,10 +57,76 @@ jobs:
                   except ValueError:
                       return e.code, {}
 
+          def write_summary():
+              """Job summary: the merge checks first (merge only), then the MR facts, commits and files."""
+              path = os.environ.get("GITHUB_STEP_SUMMARY")
+              rows = []
+              if checks:
+                  rows = ["## Kiểm tra trước khi merge", "", "| | Bước | Chi tiết |", "|---|---|---|"]
+                  rows += [f"| {'✅' if ok else '❌'} | {name} | {detail} |" for ok, name, detail in checks] + [""]
+              if path and (rows or summary):
+                  with open(path, "a", encoding="utf-8") as fh:
+                      fh.write("\n".join(rows + summary) + "\n")
+
+          def stop(msg):
+              """End the run as failed, with the reason in the log, the summary and the script's error line."""
+              summary.append(f"\n**❌ {msg}**")
+              write_summary()
+              sys.exit(msg)
+
+          def info(line):
+              print("MR_INFO " + line)
+
           def open_mr():
               q = urllib.parse.urlencode({"state": "opened", "source_branch": src, "target_branch": dst})
               code, found = call("GET", api + "/merge_requests?" + q)
               return found[0] if code == 200 and found else {}
+
+          def describe(mr):
+              """MR facts + changed files (+/− lines) into the log (MR_INFO …) and the Job summary."""
+              iid = mr["iid"]
+              _, full = call("GET", api + f"/merge_requests/{iid}")
+              mr = full or mr
+              _, commits = call("GET", api + f"/merge_requests/{iid}/commits?per_page=100")
+              files, page = [], 1
+              while page and page <= 10:                 # /diffs pages: 100 files each, at most 1,000 files
+                  code, part = call("GET", api + f"/merge_requests/{iid}/diffs?per_page=100&page={page}")
+                  if code != 200 or not isinstance(part, list):
+                      break
+                  files += part
+                  page = page + 1 if len(part) == 100 else 0
+              commits = commits if isinstance(commits, list) else []
+              info(f"!{iid} {mr.get('title', '')}")
+              info(f"{src} → {dst} | state={mr.get('state')} draft={bool(mr.get('draft'))} "
+                   f"merge_status={mr.get('detailed_merge_status')} conflicts={bool(mr.get('has_conflicts'))} "
+                   f"commits={len(commits)} files={len(files)}")
+              summary.extend([f"## !{iid} {mr.get('title', '')}", "",
+                              f"[{mr.get('web_url')}]({mr.get('web_url')})", "",
+                              "| | |", "|---|---|",
+                              f"| Nhánh | `{src}` → `{dst}` |",
+                              f"| Trạng thái | {mr.get('state')}{' (Draft)' if mr.get('draft') else ''} |",
+                              f"| Merge status | `{mr.get('detailed_merge_status')}` |",
+                              f"| Conflict | {'có' if mr.get('has_conflicts') else 'không'} |",
+                              f"| Commit | {len(commits)} |", f"| File thay đổi | {len(files)} |", ""])
+              if commits:
+                  summary.append("### Commit")
+                  summary.extend(f"- `{c.get('short_id')}` {c.get('title', '')}" for c in reversed(commits))
+                  summary.append("")
+              if files:
+                  summary.extend(["### File thay đổi", "", "| File | Loại | + | − |", "|---|---|---:|---:|"])
+                  for f in files:
+                      lines = (f.get("diff") or "").splitlines()
+                      add = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
+                      rem = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
+                      kind = ("mới" if f.get("new_file") else "xoá" if f.get("deleted_file")
+                              else "đổi tên" if f.get("renamed_file") else "sửa")
+                      name = f.get("new_path") or f.get("old_path")
+                      if f.get("renamed_file"):
+                          name = f"{f.get('old_path')} → {f.get('new_path')}"
+                      info(f"  {kind:7} +{add:<5} -{rem:<5} {name}")
+                      summary.append(f"| `{name}` | {kind} | {add} | {rem} |")
+                  summary.append("")
+              return mr
 
           def done(mr, extra=""):
               print(f"{src} → {dst}: !{mr['iid']} {mr['title']}{extra}")
@@ -73,45 +144,64 @@ jobs:
               if code == 409:   # an open MR for this source → target already exists
                   mr = open_mr()
                   print("MR đã có sẵn")
+                  summary.append("_MR đã có sẵn: không tạo mới._\n")
               if not mr.get("web_url"):
-                  sys.exit(f"GitLab HTTP {code}: {mr.get('message') or mr}")
-              done(mr)
+                  stop(f"GitLab HTTP {code}: {mr.get('message') or mr}")
+              done(describe(mr))
+              write_summary()
 
           elif action == "merge":
+              # Merge logic, step by step. Each step is logged (✅ / ❌ + why); the first ❌ stops the run, nothing merged.
+              def check(ok, name, detail):
+                  checks.append((ok, name, detail))
+                  print(f"MR_INFO {'✅' if ok else '❌'} {name}: {detail}")
+                  if not ok:
+                      stop(f"merge refused: {name}: {detail}")
+
+              # 1. only the test branches (dev / develop): staging and main are merged by hand
               allowed = [t.strip() for t in os.environ["MERGE_TARGETS"].split(",") if t.strip()]
-              if dst not in allowed:
-                  sys.exit(f"merge refused: target {dst} is not one of {allowed} (staging / main are merged by hand)")
+              check(dst in allowed, "Nhánh đích được phép",
+                    f"{dst} thuộc {allowed}" if dst in allowed else f"{dst} không thuộc {allowed} (staging / main merge tay)")
+              # 2. an open MR source → target exists
               mr = open_mr()
-              if not mr:
-                  sys.exit(f"no open merge request {src} → {dst}")
-              code, mr = call("GET", api + f"/merge_requests/{mr['iid']}")
-              if mr.get("draft") or mr.get("work_in_progress"):
-                  sys.exit(f"merge refused: !{mr['iid']} is Draft")
-              if mr.get("has_conflicts"):
-                  sys.exit(f"merge refused: !{mr['iid']} has conflicts with {dst}")
+              check(bool(mr), "Có MR đang mở", f"!{mr['iid']}" if mr else f"không có MR mở {src} → {dst}")
+              mr = describe(mr)
+              # 3. not Draft: a Draft MR is not meant to be merged yet
+              draft = bool(mr.get("draft") or mr.get("work_in_progress"))
+              check(not draft, "Không phải Draft", "Draft" if draft else "MR thường")
+              # 4. no conflict with the target
+              check(not mr.get("has_conflicts"), "Không conflict",
+                    f"conflict với {dst}" if mr.get("has_conflicts") else f"merge sạch vào {dst}")
+              # 5. the MR is at the commit the script pushed: a push in between would merge code nobody tested
               sha = str(p.get("sha") or "").strip()
-              if sha and not str(mr.get("sha") or "").startswith(sha):
-                  sys.exit(f"merge refused: !{mr['iid']} is at {mr.get('sha', '')[:8]}, not the pushed {sha[:8]}")
-              # GitLab computes mergeability in the background right after a push: wait for it
+              same = not sha or str(mr.get("sha") or "").startswith(sha)
+              check(same, "Đúng commit đã push",
+                    "không gửi sha (bỏ qua)" if not sha else
+                    f"{sha[:8]}" if same else f"MR ở {str(mr.get('sha', ''))[:8]}, không phải {sha[:8]} (có push mới xen giữa)")
+              # 6. GitLab computes mergeability in the background right after a push: wait for it (≤ 60 s)
               for _ in range(12):
                   status = mr.get("detailed_merge_status") or ""
                   if status not in ("checking", "unchecked", "preparing", "approvals_syncing"):
                       break
                   time.sleep(5)
-                  code, mr = call("GET", api + f"/merge_requests/{mr['iid']}")
-              print(f"detailed_merge_status={status}")
-              body = {"sha": mr["sha"], "should_remove_source_branch": False}
+                  _, mr = call("GET", api + f"/merge_requests/{mr['iid']}")
+              # 7. mergeable → merge now; pipeline still running / must pass → auto-merge when it succeeds;
+              #    anything else (not approved, discussions open, blocked…) → refuse
+              body = {"sha": mr["sha"], "should_remove_source_branch": False}   # keep the source branch
               if status in ("ci_still_running", "ci_must_pass"):
-                  body["auto_merge"] = True                  # merge when the pipeline succeeds
-              elif status != "mergeable":
-                  sys.exit(f"merge refused: !{mr['iid']} detailed_merge_status={status}")
+                  body["auto_merge"] = True
+                  check(True, "Trạng thái merge", f"{status}: bật auto-merge (GitLab merge khi pipeline đạt)")
+              else:
+                  check(status == "mergeable", "Trạng thái merge",
+                        "mergeable" if status == "mergeable" else f"{status}: GitLab chưa cho merge")
               code, out = call("PUT", api + f"/merge_requests/{mr['iid']}/merge", body)
-              if code != 200:
-                  sys.exit(f"GitLab merge HTTP {code}: {out.get('message') or out}")
+              check(code == 200, "GitLab merge", "OK" if code == 200 else f"HTTP {code}: {out.get('message') or out}")
               state = "merged" if out.get("state") == "merged" else "auto_merge"
+              summary.append(f"\n**{'✅ Đã merge' if state == 'merged' else '⏳ Auto-merge: chờ pipeline'}**")
               done(out, f" ({state})")
               print("MERGE=" + state)
+              write_summary()
 
           else:
-              sys.exit(f"unknown action {action}")
+              stop(f"unknown action {action}")
           PY
