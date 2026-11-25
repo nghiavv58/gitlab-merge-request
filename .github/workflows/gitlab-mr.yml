@@ -10,6 +10,9 @@
 # Mỗi run ghi vào Job summary (trang run → Summary) và log: thông tin MR (nguồn → đích, trạng thái, commit), danh sách
 # file thay đổi (+/− dòng) và, với merge, từng bước kiểm tra trước khi merge (✅ / ❌ + lý do). Script trên VPS in lại
 # các dòng "MR_INFO ..." của log.
+# Telegram (tuỳ chọn): có secret TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID thì sau mỗi create / merge (và info khi payload
+# notify=true) workflow tự gửi 1 tin: kết quả, nhánh, link MR, file thay đổi, bước merge ❌. Gửi được thì in "TG_SENT=1"
+# (script trên VPS khi đó không gửi tin trùng). Không có secret thì bỏ qua.
 name: GitLab merge request
 run-name: "${{ github.event.client_payload.action || 'create' }} ${{ github.event.client_payload.target_branch || github.event.client_payload.query }} ${{ github.event.client_payload.request_id }}"
 
@@ -31,6 +34,8 @@ jobs:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
           MERGE_TARGETS: dev,develop
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -46,6 +51,8 @@ jobs:
           head = {"PRIVATE-TOKEN": os.environ["GITLAB_TOKEN"], "Content-Type": "application/json"}
           summary = []          # markdown of the Job summary, written at the end (also when the run stops early)
           checks = []           # merge: (ok, check, detail), in the order they are made
+          facts = {}            # last MR described: iid, title, url, files [(kind, +, -, path)], commits
+          tg_lines = []         # info: extra lines of the Telegram message
 
           def call(method, url, body=None):
               req = urllib.request.Request(url, method=method, headers=head,
@@ -59,8 +66,47 @@ jobs:
                   except ValueError:
                       return e.code, {}
 
-          def write_summary():
-              """Job summary: the merge checks first (merge only), then the MR facts, commits and files."""
+          def esc(t):
+              return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+          def notify(outcome):
+              """One Telegram message per run (HTML). Never fails the run; never prints the token."""
+              token, chat = os.environ.get("TELEGRAM_BOT_TOKEN", ""), os.environ.get("TELEGRAM_CHAT_ID", "")
+              if not token or not chat or (action == "info" and not p.get("notify")):
+                  return
+              name = p["project"].split("/")[-1]
+              lines = [f"{outcome}", f"📦 <b>{esc(name)}</b>"]
+              if src or dst:
+                  lines.append(f"🌿 <code>{esc(src)}</code> → <code>{esc(dst)}</code>")
+              if facts.get("iid"):
+                  lines.append(f'🔀 <a href="{esc(facts["url"])}">!{facts["iid"]}</a> {esc(facts.get("title", ""))}')
+              bad = [c for c in checks if not c[0]]
+              if bad:
+                  lines.append(f"❌ <b>{esc(bad[0][1])}</b>: {esc(bad[0][2])}")
+              files = facts.get("files") or []
+              if files:
+                  lines.append(f"📄 {len(files)} file, {facts.get('commits', 0)} commit:")
+                  for kind, add, rem, path in files[:15]:
+                      lines.append(f"  • <code>{esc(path)}</code> +{add} −{rem}" + ("" if kind == "sửa" else f" ({kind})"))
+                  if len(files) > 15:
+                      lines.append(f"  … và {len(files) - 15} file khác")
+              lines += tg_lines
+              run = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{os.environ.get('GITHUB_REPOSITORY', '')}" \
+                    f"/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
+              lines.append(f'⚙️ <a href="{esc(run)}">GitHub run</a>')
+              text = "\n".join(lines)[:4000]
+              data = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
+                                             "disable_web_page_preview": "true"}).encode()
+              try:
+                  with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=15) as r:
+                      if json.load(r).get("ok"):
+                          print("TG_SENT=1")
+              except Exception as e:   # never print the URL: it holds the token
+                  print(f"telegram: gửi lỗi ({type(e).__name__})")
+
+          def write_summary(outcome=""):
+              """Job summary: the merge checks first (merge only), then the MR facts, commits and files.
+              Then the Telegram message (outcome = its first line)."""
               path = os.environ.get("GITHUB_STEP_SUMMARY")
               rows = []
               if checks:
@@ -69,11 +115,14 @@ jobs:
               if path and (rows or summary):
                   with open(path, "a", encoding="utf-8") as fh:
                       fh.write("\n".join(rows + summary) + "\n")
+              if outcome:
+                  notify(outcome)
 
           def stop(msg):
               """End the run as failed, with the reason in the log, the summary and the script's error line."""
               summary.append(f"\n**❌ {msg}**")
-              write_summary()
+              label = {"create": "Không tạo được MR", "merge": "Không merge", "info": "Không đọc được"}.get(action, action)
+              write_summary(f"❌ <b>{label}</b>" + ("" if checks else f": {esc(msg[:300])}"))
               sys.exit(msg)
 
           def info(line):
@@ -98,6 +147,7 @@ jobs:
                   files += part
                   page = page + 1 if len(part) == 100 else 0
               commits = commits if isinstance(commits, list) else []
+              facts.update(iid=iid, title=mr.get("title", ""), url=mr.get("web_url", ""), commits=len(commits), files=[])
               info(f"!{iid} {mr.get('title', '')}")
               info(f"{src} → {dst} | state={mr.get('state')} draft={bool(mr.get('draft'))} "
                    f"merge_status={mr.get('detailed_merge_status')} conflicts={bool(mr.get('has_conflicts'))} "
@@ -126,6 +176,7 @@ jobs:
                       if f.get("renamed_file"):
                           name = f"{f.get('old_path')} → {f.get('new_path')}"
                       info(f"  {kind:7} +{add:<5} -{rem:<5} {name}")
+                      facts["files"].append((kind, add, rem, name))
                       summary.append(f"| `{name}` | {kind} | {add} | {rem} |")
                   summary.append("")
               return mr
@@ -143,14 +194,16 @@ jobs:
               if str(p.get("assignee_id") or "").isdigit():
                   body["assignee_id"] = int(p["assignee_id"])
               code, mr = call("POST", api + "/merge_requests", body)
-              if code == 409:   # an open MR for this source → target already exists
+              existed = code == 409
+              if existed:   # an open MR for this source → target already exists
                   mr = open_mr()
                   print("MR đã có sẵn")
                   summary.append("_MR đã có sẵn: không tạo mới._\n")
               if not mr.get("web_url"):
                   stop(f"GitLab HTTP {code}: {mr.get('message') or mr}")
               done(describe(mr))
-              write_summary()
+              write_summary("ℹ️ <b>MR đã có sẵn</b>" if existed else
+                            f"🆕 <b>Đã tạo MR</b>{' (Draft)' if title.startswith('Draft:') else ''}")
 
           elif action == "merge":
               # Merge logic, step by step. Each step is logged (✅ / ❌ + why); the first ❌ stops the run, nothing merged.
@@ -202,7 +255,7 @@ jobs:
               summary.append(f"\n**{'✅ Đã merge' if state == 'merged' else '⏳ Auto-merge: chờ pipeline'}**")
               done(out, f" ({state})")
               print("MERGE=" + state)
-              write_summary()
+              write_summary("✅ <b>Đã merge</b>" if state == "merged" else "⏳ <b>Auto-merge</b>: GitLab merge khi pipeline đạt")
 
           elif action == "info":
               # read only: GET requests, nothing is created, merged or changed
@@ -248,7 +301,12 @@ jobs:
                   summary.append(f"| [!{m['iid']}]({m['url']}) | `{m['source']}` → `{m['target']}` | "
                                  f"{'có' if m['draft'] else ''} | `{m['merge_status']}` | {'có' if m['conflicts'] else ''} | {m['updated']} |")
               print("INFO_JSON=" + json.dumps({"query": query, "branches": branches, "open_mrs": opened}, ensure_ascii=False))
-              write_summary()
+              tg_lines += [f"🌿 <code>{esc(b['name'])}</code>: đã merge "
+                           f"{esc(', '.join(m['target'] + ' !' + str(m['iid']) for m in b['merged_mrs']) or '—')}"
+                           for b in branches[:10]]
+              tg_lines += [f'🔀 <a href="{esc(m["url"])}">!{m["iid"]}</a> {esc(m["source"])} → {esc(m["target"])}'
+                           f"{' Draft' if m['draft'] else ''} <code>{esc(m['merge_status'])}</code>" for m in opened[:15]]
+              write_summary(f"🔎 <b>{esc(query or 'MR đang mở')}</b>: {len(branches)} nhánh, {len(opened)} MR đang mở")
 
           else:
               stop(f"unknown action {action}")
