@@ -138,7 +138,11 @@ jobs:
               iid = mr["iid"]
               _, full = call("GET", api + f"/merge_requests/{iid}")
               mr = full or mr
-              _, commits = call("GET", api + f"/merge_requests/{iid}/commits?per_page=100")
+              for _ in range(5):   # a new MR is "preparing" for a few seconds: its commit list comes back empty
+                  _, commits = call("GET", api + f"/merge_requests/{iid}/commits?per_page=100")
+                  if commits:
+                      break
+                  time.sleep(2)
               files, page = [], 1
               while page and page <= 10:                 # /diffs pages: 100 files each, at most 1,000 files
                   code, part = call("GET", api + f"/merge_requests/{iid}/diffs?per_page=100&page={page}")
