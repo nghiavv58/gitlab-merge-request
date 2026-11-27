@@ -13,6 +13,8 @@
 # Telegram (tuỳ chọn): có secret TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID thì sau mỗi create / merge (và info khi payload
 # notify=true) workflow tự gửi 1 tin: kết quả, nhánh, link MR, file thay đổi, bước merge ❌. Gửi được thì in "TG_SENT=1"
 # (script trên VPS khi đó không gửi tin trùng). Không có secret thì bỏ qua.
+# Topic (nhóm "VPS" có Topics): thêm secret TELEGRAM_THREAD_ID = id topic (GitHub = 5, xem .share
+# secrets/env/telegram-group.env); TELEGRAM_CHAT_ID = id nhóm, TELEGRAM_BOT_TOKEN = bot gitlab-feed. Trống = chat thường.
 name: GitLab merge request
 run-name: "${{ github.event.client_payload.action || 'create' }} ${{ github.event.client_payload.target_branch || github.event.client_payload.query }} ${{ github.event.client_payload.request_id }}"
 
@@ -36,6 +38,7 @@ jobs:
           MERGE_TARGETS: dev,develop
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -95,8 +98,10 @@ jobs:
                     f"/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
               lines.append(f'⚙️ <a href="{esc(run)}">GitHub run</a>')
               text = "\n".join(lines)[:4000]
-              data = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
-                                             "disable_web_page_preview": "true"}).encode()
+              fields = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}
+              if os.environ.get("TELEGRAM_THREAD_ID"):   # topic of a forum group
+                  fields["message_thread_id"] = os.environ["TELEGRAM_THREAD_ID"]
+              data = urllib.parse.urlencode(fields).encode()
               try:
                   with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=15) as r:
                       if json.load(r).get("ok"):
