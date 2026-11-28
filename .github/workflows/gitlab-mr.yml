@@ -11,10 +11,11 @@
 # file thay đổi (+/− dòng) và, với merge, từng bước kiểm tra trước khi merge (✅ / ❌ + lý do). Script trên VPS in lại
 # các dòng "MR_INFO ..." của log.
 # Telegram (tuỳ chọn): có secret TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID thì sau mỗi create / merge (và info khi payload
-# notify=true) workflow tự gửi 1 tin: kết quả, nhánh, link MR, file thay đổi, bước merge ❌. Gửi được thì in "TG_SENT=1"
+# notify=true) workflow tự gửi 1 tin: kết quả, nhánh, link MR, bước merge ❌ (không liệt kê file). Gửi được thì in "TG_SENT=1"
 # (script trên VPS khi đó không gửi tin trùng). Không có secret thì bỏ qua.
-# Topic (nhóm "VPS" có Topics): thêm secret TELEGRAM_THREAD_ID = id topic (GitHub = 5, xem .share
-# secrets/env/telegram-group.env); TELEGRAM_CHAT_ID = id nhóm, TELEGRAM_BOT_TOKEN = bot gitlab-feed. Trống = chat thường.
+# Topic (nhóm "VPS" có Topics): TELEGRAM_THREAD_ID ghi thẳng "5" trong env bên dưới (topic GitHub, xem .share
+# secrets/env/telegram-group.env); TELEGRAM_CHAT_ID = id nhóm, TELEGRAM_BOT_TOKEN = bot gitlab-feed. Không để id topic
+# là secret: GitHub che mọi chữ "5" trong log (số MR !725 → !72***); secret TELEGRAM_THREAD_ID cũ xoá đi.
 name: GitLab merge request
 run-name: "${{ github.event.client_payload.action || 'create' }} ${{ github.event.client_payload.target_branch || github.event.client_payload.query }} ${{ github.event.client_payload.request_id }}"
 
@@ -38,7 +39,9 @@ jobs:
           MERGE_TARGETS: dev,develop
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          # topic GitHub của nhóm VPS (secrets/env/telegram-group.env TELEGRAM_TOPIC_GITHUB), ghi thẳng: id topic không bí
+          # mật; để là secret thì GitHub che mọi chữ số 5 trong log (!725 → !72***). Đổi topic thì sửa ở đây.
+          TELEGRAM_THREAD_ID: "5"
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -86,17 +89,11 @@ jobs:
               bad = [c for c in checks if not c[0]]
               if bad:
                   lines.append(f"❌ <b>{esc(bad[0][1])}</b>: {esc(bad[0][2])}")
-              files = facts.get("files") or []
-              if files:
-                  lines.append(f"📄 {len(files)} file, {facts.get('commits', 0)} commit:")
-                  for kind, add, rem, path in files[:15]:
-                      lines.append(f"  • <code>{esc(path)}</code> +{add} −{rem}" + ("" if kind == "sửa" else f" ({kind})"))
-                  if len(files) > 15:
-                      lines.append(f"  … và {len(files) - 15} file khác")
+              # 28/11 (người dùng): không liệt kê file trong tin Telegram (danh sách file: Job summary + log MR_INFO)
               lines += tg_lines
               run = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{os.environ.get('GITHUB_REPOSITORY', '')}" \
                     f"/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
-              lines.append(f'⚙️ <a href="{esc(run)}">GitHub run</a>')
+              lines += ["", f'⚙️ <a href="{esc(run)}">GitHub run</a>']
               text = "\n".join(lines)[:4000]
               fields = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}
               if os.environ.get("TELEGRAM_THREAD_ID"):   # topic of a forum group
@@ -320,3 +317,11 @@ jobs:
           else:
               stop(f"unknown action {action}")
           PY
+
+
+
+
+
+
+
+
